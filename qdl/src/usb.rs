@@ -157,7 +157,7 @@ pub fn setup_usb_device(serial_no: Option<String>) -> Result<QdlUsbConfig> {
     let mut wr = intf.endpoint(out_ep)?.writer(1024 * 1024);
 
     rd.set_read_timeout(Duration::from_secs(10));
-    wr.set_write_timeout(Duration::from_secs(10));
+    wr.set_write_timeout(Duration::from_secs(30));
 
     Ok(QdlUsbConfig {
         _dev: dev,

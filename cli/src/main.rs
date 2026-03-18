@@ -8,6 +8,7 @@ use owo_colors::OwoColorize;
 use qdl::parsers::{firehose_parser_ack_nak, firehose_parser_configure_response};
 use qdl::sahara::{SaharaCmdModeCmd, SaharaMode, sahara_run, sahara_send_hello_rsp};
 use qdl::types::{FirehoseResetMode, FirehoseStorageType, QdlBackend, QdlDevice};
+use qdl::vip::gen_hash_tables;
 use qdl::{firehose_configure, firehose_read, firehose_reset, types::FirehoseConfiguration};
 use qdl::{
     firehose_get_default_sector_size, firehose_nop, firehose_peek, firehose_program_storage,
@@ -184,11 +185,24 @@ struct Args {
     #[arg(long, default_value = "false")]
     verbose_firehose: bool,
 
+    #[arg(long, default_value = "false")]
+    vip_dry_run: bool,
+
+    #[arg(short, default_value = "out/")]
+    vip_output_dir: String,
+
+    #[arg(short = 'M')]
+    vip_mbn_path: Option<String>,
+
+    #[arg(short = 'T')]
+    vip_aux_tbl_path: Option<String>,
+
     #[command(subcommand)]
     command: Command,
 }
 
 fn main() -> Result<()> {
+    env_logger::init();
     let args = Args::parse();
     let backend = match args.backend {
         Some(b) => QdlBackend::from_str(&b)?,
@@ -202,6 +216,25 @@ fn main() -> Result<()> {
         Err(e) => bail!("Couldn't open the programmer binary: {}", e.to_string()),
     };
 
+    let vip_mbn = match args.vip_mbn_path {
+        Some(p) => match fs::read(p) {
+            Ok(m) => m,
+            Err(e) => bail!("Couldn't read the VIP MBN: {}", e.to_string()),
+        },
+        None => vec![],
+    };
+
+    let vip_aux = match args.vip_aux_tbl_path {
+        Some(p) => match fs::read(p) {
+            Ok(a) => a,
+            Err(e) => bail!(
+                "Couldn't read the VIP chained table file: {}",
+                e.to_string()
+            ),
+        },
+        None => vec![],
+    };
+
     println!(
         "{} {}",
         env!("CARGO_PKG_NAME").green(),
@@ -209,9 +242,17 @@ fn main() -> Result<()> {
     );
 
     // Set up the device
-    let rw_channel = match setup_target_device(backend, args.serial_no, args.dev_path) {
-        Ok(c) => c,
-        Err(e) => bail!("Couldn't set up device: {}", e.to_string()),
+    let rw_channel: Box<dyn qdl::types::QdlReadWrite> = if args.vip_dry_run {
+        println!(
+            "{}",
+            "Dry-run mode: skipping device connection and Sahara".bright_black()
+        );
+        Box::new(qdl::types::NullChannel)
+    } else {
+        match setup_target_device(backend, args.serial_no, args.dev_path) {
+            Ok(c) => c,
+            Err(e) => bail!("Couldn't set up device: {}", e.to_string()),
+        }
     };
     let mut qdl_dev = QdlDevice {
         rw: rw_channel,
@@ -235,58 +276,77 @@ fn main() -> Result<()> {
             backend,
             skip_firehose_log: !args.print_firehose_log,
             verbose_firehose: args.verbose_firehose,
+            dry_run: args.vip_dry_run,
             // The remaining values are overwritten at runtime through a <configure> handshake
             ..Default::default()
         },
         reset_on_drop: false,
+        digests: vec![],
+        vip_digest_table: vip_aux,
+        vip_signed_mbn: vip_mbn,
+        send_counter: 0,
+        vip_digest_offset: 0,
     };
 
-    // In case another program on the system has already consumed the HELLO packet,
-    // send a HELLO response upfront, to appease the state machine
-    if args.skip_hello_wait {
-        sahara_send_hello_rsp(&mut qdl_dev, SaharaMode::Command)?;
+    if !args.vip_dry_run {
+        // In case another program on the system has already consumed the HELLO packet,
+        // send a HELLO response upfront, to appease the state machine
+        if args.skip_hello_wait {
+            sahara_send_hello_rsp(&mut qdl_dev, SaharaMode::Command)?;
+        }
+
+        // Get some info about the device
+        let sn = sahara_run(
+            &mut qdl_dev,
+            SaharaMode::Command,
+            Some(SaharaCmdModeCmd::ReadSerialNum),
+            &mut [],
+            vec![],
+            args.verbose_sahara,
+        )?;
+        let sn = u32::from_le_bytes([sn[0], sn[1], sn[2], sn[3]]);
+        println!("Chip serial number: 0x{sn:x}");
+
+        let key_hash = sahara_run(
+            &mut qdl_dev,
+            SaharaMode::Command,
+            Some(SaharaCmdModeCmd::ReadOemKeyHash),
+            &mut [],
+            vec![],
+            args.verbose_sahara,
+        )?;
+        println!(
+            "OEM Private Key hash: 0x{:02x}",
+            key_hash[..key_hash.len() / 3].iter().format("")
+        );
+
+        // Send the loader (and any other images)
+        sahara_run(
+            &mut qdl_dev,
+            SaharaMode::WaitingForImage,
+            None,
+            &mut [mbn_loader],
+            vec![],
+            args.verbose_sahara,
+        )?;
+
+        // If we're past Sahara, activate the Firehose reset-on-drop listener
+        qdl_dev.reset_on_drop = true;
+
+        // If VIP is used, the hash table must be sent first, even before <configure>
+        if !qdl_dev.vip_signed_mbn.is_empty() {
+            println!("VIP: sending {} bytes", qdl_dev.vip_signed_mbn.len());
+            let result = qdl_dev.rw.write_all(&qdl_dev.vip_signed_mbn.clone());
+            println!("VIP: send result: {:?}", result);
+
+            // Read whatever the device sends back
+            let response = firehose_read(&mut qdl_dev, firehose_parser_ack_nak);
+            println!("VIP: device response: {:?}", response);
+        }
+
+        // Get any "welcome" logs
+        firehose_read(&mut qdl_dev, firehose_parser_ack_nak)?;
     }
-
-    // Get some info about the device
-    let sn = sahara_run(
-        &mut qdl_dev,
-        SaharaMode::Command,
-        Some(SaharaCmdModeCmd::ReadSerialNum),
-        &mut [],
-        vec![],
-        args.verbose_sahara,
-    )?;
-    let sn = u32::from_le_bytes([sn[0], sn[1], sn[2], sn[3]]);
-    println!("Chip serial number: 0x{sn:x}");
-
-    let key_hash = sahara_run(
-        &mut qdl_dev,
-        SaharaMode::Command,
-        Some(SaharaCmdModeCmd::ReadOemKeyHash),
-        &mut [],
-        vec![],
-        args.verbose_sahara,
-    )?;
-    println!(
-        "OEM Private Key hash: 0x{:02x}",
-        key_hash[..key_hash.len() / 3].iter().format("")
-    );
-
-    // Send the loader (and any other images)
-    sahara_run(
-        &mut qdl_dev,
-        SaharaMode::WaitingForImage,
-        None,
-        &mut [mbn_loader],
-        vec![],
-        args.verbose_sahara,
-    )?;
-
-    // If we're past Sahara, activate the Firehose reset-on-drop listener
-    qdl_dev.reset_on_drop = true;
-
-    // Get any "welcome" logs
-    firehose_read(&mut qdl_dev, firehose_parser_ack_nak)?;
 
     // Send the host capabilities to the device
     firehose_configure(&mut qdl_dev, args.skip_storage_init)?;
@@ -426,9 +486,18 @@ fn main() -> Result<()> {
         }
     };
 
-    // Finally, reset the device
-    qdl_dev.reset_on_drop = false;
-    firehose_reset(&mut qdl_dev, &reset_mode, 0)?;
+    if args.vip_dry_run {
+        println!("{}", "Dry-run complete.".green());
+        return gen_hash_tables(
+            qdl_dev.digests.clone(),
+            Path::new(&args.vip_output_dir),
+            8192,
+        );
+    } else {
+        // Finally, reset the device
+        qdl_dev.reset_on_drop = false;
+        firehose_reset(&mut qdl_dev, &reset_mode, 0)?;
+    }
 
     println!(
         "{} {}",

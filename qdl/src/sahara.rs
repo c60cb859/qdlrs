@@ -484,6 +484,10 @@ pub fn sahara_run<T: QdlChan>(
     filenames: Vec<String>,
     verbose: bool,
 ) -> Result<Vec<u8>> {
+    if channel.fh_config().dry_run {
+        return Ok(vec![]);
+    }
+
     let mut buf = vec![0; 4096];
 
     loop {

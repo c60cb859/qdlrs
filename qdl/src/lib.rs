@@ -26,6 +26,8 @@ pub mod serial;
 pub mod types;
 #[cfg(feature = "usb")]
 pub mod usb;
+#[cfg(feature = "vip")]
+pub mod vip;
 
 pub fn setup_target_device(
     backend: QdlBackend,
@@ -75,6 +77,10 @@ pub fn firehose_read<T: QdlChan>(
     channel: &mut T,
     response_parser: fn(&mut T, &IndexMap<String, String>) -> Result<FirehoseStatus, anyhow::Error>,
 ) -> Result<FirehoseStatus, anyhow::Error> {
+    if channel.fh_config().dry_run {
+        return Ok(FirehoseStatus::Ack);
+    }
+
     let mut got_any_data = false;
     let mut pending: Vec<u8> = Vec::new();
 
@@ -197,7 +203,36 @@ pub fn firehose_read<T: QdlChan>(
 }
 
 /// Send a Firehose packet
-pub fn firehose_write<T: QdlChan>(channel: &mut T, buf: &mut [u8]) -> anyhow::Result<()> {
+pub fn firehose_write<T: QdlChan>(channel: &mut T, buf: &[u8]) -> anyhow::Result<()> {
+    channel.increment_send_count();
+    let count = channel.get_send_count();
+
+    if (count - 54) % 256 == 0 {
+        let chain_table = channel
+            .next_digest_chunk(32 * 256)
+            .unwrap_or_default()
+            .to_vec();
+        channel.increment_send_count();
+        let _ = channel.write_all(&chain_table);
+        // TODO: figure out some sane way to figure out the timeout
+        if firehose_read::<T>(channel, firehose_parser_ack_nak)? != FirehoseStatus::Ack {
+            bail!("Checksum request was NAKed");
+        }
+    }
+
+    match channel.write_all(&buf) {
+        Ok(_) => Ok(()),
+        // Assume FH will hang after NAK..
+        Err(_) => firehose_reset(channel, &FirehoseResetMode::ResetToEdl, 0),
+    }
+}
+
+pub fn firehose_write_xml<T: QdlChan>(channel: &mut T, buf: &mut [u8]) -> anyhow::Result<()> {
+    if channel.fh_config().dry_run {
+        channel.record_xml_command(&buf);
+        return Ok(());
+    }
+
     let mut b = buf.to_vec();
 
     // XML can't be n * 512 bytes long by fh spec
@@ -205,12 +240,15 @@ pub fn firehose_write<T: QdlChan>(channel: &mut T, buf: &mut [u8]) -> anyhow::Re
         println!("{}", "INFO: Appending '\n' to outgoing XML".bright_black());
         b.push(b'\n');
     }
+    firehose_write(channel, &b)
+}
 
-    match channel.write_all(&b) {
-        Ok(_) => Ok(()),
-        // Assume FH will hang after NAK..
-        Err(_) => firehose_reset(channel, &FirehoseResetMode::ResetToEdl, 0),
+pub fn firehose_write_data<T: QdlChan>(channel: &mut T, buf: &mut [u8]) -> anyhow::Result<()> {
+    if channel.fh_config().dry_run {
+        channel.record_data_command(&buf);
+        return Ok(());
     }
+    firehose_write(channel, &buf)
 }
 
 /// Send a Firehose packet and check for ack/nak
@@ -219,7 +257,7 @@ pub fn firehose_write_getack<T: QdlChan>(
     buf: &mut [u8],
     couldnt_what: String,
 ) -> anyhow::Result<()> {
-    firehose_write(channel, buf)?;
+    firehose_write_xml(channel, buf)?;
 
     match firehose_read::<T>(channel, firehose_parser_ack_nak) {
         Ok(FirehoseStatus::Ack) => Ok(()),
@@ -296,7 +334,7 @@ pub fn firehose_configure<T: QdlChan>(
         ],
     )?;
 
-    firehose_write(channel, &mut xml)
+    firehose_write_xml(channel, &mut xml)
 }
 
 /// Do nothing, hopefully succesfully
@@ -317,7 +355,7 @@ pub fn firehose_get_storage_info<T: QdlChan>(
         &[("physical_partition_number", &phys_part_idx.to_string())],
     )?;
 
-    firehose_write(channel, &mut xml)?;
+    firehose_write_xml(channel, &mut xml)?;
 
     firehose_read::<T>(channel, firehose_parser_ack_nak).and(Ok(()))
 }
@@ -414,62 +452,75 @@ pub fn firehose_program_storage<T: QdlChan>(
     let mut xml = firehose_xml_setup(
         "program",
         &[
+            ("start_sector", start_sector),
+            ("physical_partition_number", &phys_part_idx.to_string()),
+            ("num_partition_sectors", &num_sectors.to_string()),
+            (
+                "readbackverify",
+                &(channel.fh_config().read_back_verify as u32).to_string(),
+            ),
             (
                 "SECTOR_SIZE_IN_BYTES",
                 &channel.fh_config().storage_sector_size.to_string(),
             ),
-            ("num_partition_sectors", &num_sectors.to_string()),
+            ("label", &label),
             ("slot", &slot.to_string()),
-            ("physical_partition_number", &phys_part_idx.to_string()),
-            ("start_sector", start_sector),
-            (
-                "read_back_verify",
-                &(channel.fh_config().read_back_verify as u32).to_string(),
-            ),
         ],
     )?;
 
-    firehose_write(channel, &mut xml)?;
-
-    if firehose_read::<T>(channel, firehose_parser_ack_nak)? != FirehoseStatus::Ack {
-        bail!("<program> was NAKed. Did you set sector-size correctly?");
-    }
-
-    let mut pb = ProgressBar::new((sectors_left * channel.fh_config().storage_sector_size) as u64);
-    pb.show_time_left = true;
-    pb.message(&format!("Sending partition {label}: "));
-    pb.set_units(Units::Bytes);
-
-    while sectors_left > 0 {
-        let chunk_size_sectors = min(
-            sectors_left,
-            channel.fh_config().send_buffer_size / channel.fh_config().storage_sector_size,
-        );
-        let mut buf = vec![
-            0u8;
-            min(
-                channel.fh_config().send_buffer_size,
-                chunk_size_sectors * channel.fh_config().storage_sector_size,
-            )
-        ];
-        let _ = data.read(&mut buf).unwrap();
-
-        let n = channel.write(&buf).expect("Error sending data");
-        if n != chunk_size_sectors * channel.fh_config().storage_sector_size {
-            bail!("Wrote an unexpected number of bytes ({})", n);
+    firehose_write_xml(channel, &mut xml)?;
+    if !channel.fh_config().dry_run {
+        if firehose_read::<T>(channel, firehose_parser_ack_nak)? != FirehoseStatus::Ack {
+            bail!("<program> was NAKed. Did you set sector-size correctly?");
         }
 
-        sectors_left -= chunk_size_sectors;
-        pb.add((chunk_size_sectors * channel.fh_config().storage_sector_size) as u64);
-    }
+        let mut pb =
+            ProgressBar::new((sectors_left * channel.fh_config().storage_sector_size) as u64);
+        pb.show_time_left = true;
+        pb.message(&format!("Sending partition {label}: "));
+        pb.set_units(Units::Bytes);
 
-    // Send a Zero-Length Packet to indicate end of stream
-    if channel.fh_config().backend == QdlBackend::Usb {
-        let _ = channel.write(&[]).expect("Error sending ZLP");
-    }
+        while sectors_left > 0 {
+            let chunk_size_sectors = min(
+                sectors_left,
+                channel.fh_config().send_buffer_size / channel.fh_config().storage_sector_size,
+            );
+            let mut buf = vec![
+                0u8;
+                min(
+                    channel.fh_config().send_buffer_size,
+                    chunk_size_sectors * channel.fh_config().storage_sector_size,
+                )
+            ];
+            let _ = data.read(&mut buf).unwrap();
 
-    if firehose_read::<T>(channel, firehose_parser_ack_nak)? != FirehoseStatus::Ack {
-        bail!("Failed to complete 'write' op");
+            firehose_write_data(channel, &mut buf)?;
+
+            sectors_left -= chunk_size_sectors;
+            pb.add((chunk_size_sectors * channel.fh_config().storage_sector_size) as u64);
+        }
+
+        // // Send a Zero-Length Packet to indicate end of stream
+        // if channel.fh_config().backend == QdlBackend::Usb {
+        //     let _ = channel.write(&[]).expect("Error sending ZLP");
+        // }
+
+        if firehose_read::<T>(channel, firehose_parser_ack_nak)? != FirehoseStatus::Ack {
+            bail!("Failed to complete 'write' op");
+        }
+        pb.finish_println("");
+    } else {
+        // calculate file data hashes
+        let mut data_left = num_sectors * channel.fh_config().storage_sector_size;
+
+        while data_left > 0 {
+            let chunk_size_bytes = min(data_left, channel.fh_config().send_buffer_size);
+            let mut buf = vec![0u8; chunk_size_bytes];
+            let _ = data.read(&mut buf).unwrap();
+            channel.record_data_command(&buf);
+
+            data_left -= chunk_size_bytes;
+        }
     }
 
     Ok(())
@@ -495,7 +546,7 @@ pub fn firehose_checksum_storage<T: QdlChan>(
         ],
     )?;
 
-    firehose_write(channel, &mut xml)?;
+    firehose_write_xml(channel, &mut xml)?;
 
     // TODO: figure out some sane way to figure out the timeout
     if firehose_read::<T>(channel, firehose_parser_ack_nak)? != FirehoseStatus::Ack {
@@ -529,7 +580,7 @@ pub fn firehose_read_storage(
         ],
     )?;
 
-    firehose_write(channel, &mut xml)?;
+    firehose_write_xml(channel, &mut xml)?;
     if firehose_read(channel, firehose_parser_ack_nak)? != FirehoseStatus::Ack {
         bail!("Read request was NAKed");
     }

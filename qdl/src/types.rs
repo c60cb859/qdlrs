@@ -9,6 +9,8 @@ use std::{
 use anyhow::{Error, bail};
 use owo_colors::OwoColorize;
 
+use sha2::{Digest, Sha256};
+
 use crate::firehose_reset;
 
 /// Common respones indicating success/failure respectively
@@ -63,6 +65,8 @@ pub struct FirehoseConfiguration {
     pub backend: QdlBackend,
     pub skip_firehose_log: bool,
     pub verbose_firehose: bool,
+
+    pub dry_run: bool,
 }
 
 impl Default for FirehoseConfiguration {
@@ -79,12 +83,18 @@ impl Default for FirehoseConfiguration {
             backend: QdlBackend::default(),
             skip_firehose_log: true,
             verbose_firehose: false,
+            dry_run: false,
         }
     }
 }
 pub trait QdlChan: BufRead + Write {
     fn fh_config(&self) -> &FirehoseConfiguration;
     fn mut_fh_config(&mut self) -> &mut FirehoseConfiguration;
+    fn record_xml_command(&mut self, buf: &[u8]);
+    fn record_data_command(&mut self, buf: &[u8]);
+    fn increment_send_count(&mut self);
+    fn get_send_count(&self) -> u64;
+    fn next_digest_chunk(&mut self, chunk_size: usize) -> Option<&[u8]>;
 }
 
 pub trait QdlReadWrite: BufRead + Write + Send + Sync {}
@@ -97,6 +107,11 @@ where
     pub rw: Box<T>,
     pub fh_cfg: FirehoseConfiguration,
     pub reset_on_drop: bool,
+    pub digests: Vec<Vec<u8>>,
+    pub vip_digest_table: Vec<u8>,
+    pub vip_signed_mbn: Vec<u8>,
+    pub send_counter: u64,
+    pub vip_digest_offset: usize,
 }
 
 impl<T> Read for QdlDevice<T>
@@ -144,6 +159,39 @@ where
 
     fn mut_fh_config(&mut self) -> &mut FirehoseConfiguration {
         &mut self.fh_cfg
+    }
+
+    fn record_xml_command(&mut self, buf: &[u8]) {
+        // let xml = String::from_utf8_lossy(&buf);
+        let hash = Sha256::digest(buf).to_vec();
+        // let hash_str: String = hash.iter().map(|b| format!("{:02x}", b)).collect();
+        // println!("{} = {:?}", xml, hash_str);
+        self.digests.push(hash);
+    }
+
+    fn record_data_command(&mut self, buf: &[u8]) {
+        let hash = Sha256::digest(buf).to_vec();
+        // let _hash_str: String = hash.iter().map(|b| format!("{:02x}", b)).collect();
+        // println!("DATA = {}", hash_str);
+        self.digests.push(hash);
+    }
+
+    fn increment_send_count(&mut self) {
+        self.send_counter = self.send_counter + 1;
+    }
+
+    fn get_send_count(&self) -> u64 {
+        self.send_counter
+    }
+
+    fn next_digest_chunk(&mut self, chunk_size: usize) -> Option<&[u8]> {
+        let start = self.vip_digest_offset;
+        if start >= self.vip_digest_table.len() {
+            return None;
+        }
+        let end = (start + chunk_size).min(self.vip_digest_table.len());
+        self.vip_digest_offset = end;
+        Some(&self.vip_digest_table[start..end])
     }
 }
 
@@ -231,3 +279,29 @@ impl Display for FirehoseResetMode {
         }
     }
 }
+
+pub struct NullChannel;
+
+impl Read for NullChannel {
+    fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+        Ok(0)
+    }
+}
+
+impl Write for NullChannel {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl BufRead for NullChannel {
+    fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+        Ok(&[])
+    }
+    fn consume(&mut self, _amt: usize) {}
+}
+
+impl QdlReadWrite for NullChannel {}

@@ -48,6 +48,11 @@ pub fn main() -> Result<()> {
         rw: rw_channel,
         fh_cfg: FirehoseConfiguration::default(),
         reset_on_drop: false,
+        digests: vec![],
+        vip_digest_table: vec![],
+        vip_signed_mbn: vec![],
+        send_counter: 0,
+        vip_digest_offset: 0,
     };
 
     sahara_run(
